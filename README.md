@@ -100,11 +100,11 @@ The default features are:
 * hash: Faster replacement for `md5`, support for SHA-1, SHA-256, and SHA-512.
 * http: Asynchronous HTTP(s) client supporting most standard methods.
 * iconforge: A much faster replacement for various bulk DM /icon operations such as [/tg/station]'s asset subsystem spritesheet generation and GAGS bundle generation.
-* json: Function to check JSON validity.
+* json: JSON validation, minification, prettification, and dot-path value extraction.
 * log: Faster log output.
 * noise: 2d Perlin noise.
 * pathfinder: An a* pathfinder used for finding the shortest path in a static node map. Not to be used for a non-static map.
-* sound_len: A mostly codec-agnostic library for reading the duration of an audio file.
+* sound_len: Library for reading the duration of an audio file (MP3, OGG/Vorbis, PCM).
 * sql: Asynchronous MySQL/MariaDB client library.
   * There are also two sub-features: `native_tls` and `rustls_tls`. `rustls_tls` is a default feature, while the former is not.
 * time: High-accuracy time measuring.
