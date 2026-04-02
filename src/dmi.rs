@@ -1,3 +1,4 @@
+use crate::argus_json::{self, JsonValue, escape_json_string};
 use crate::error::{Error, Result};
 use dmi::{
     error::DmiError,
@@ -6,8 +7,6 @@ use dmi::{
 use image::Rgba;
 use png::{Decoder, Encoder, OutputInfo, Reader, text_metadata::ZTXtChunk};
 use qrcode::{QrCode, render::svg};
-use serde::{Deserialize, Serialize};
-use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{
     fmt::Write,
     fs::{File, create_dir_all},
@@ -43,7 +42,15 @@ byond_fn!(fn dmi_icon_states(path) {
 byond_fn!(fn dmi_read_metadata(path) {
     match read_metadata(path) {
         Ok(metadata) => Some(metadata),
-        Err(error) => Some(serde_json::to_string(&error.to_string()).unwrap()),
+        Err(error) => {
+            // Serialize the error string as a JSON string (quoted + escaped)
+            let err_str = error.to_string();
+            let mut out = String::with_capacity(err_str.len() + 2);
+            out.push('"');
+            escape_json_string(&err_str, &mut out);
+            out.push('"');
+            Some(out)
+        },
     }
 });
 
@@ -167,10 +174,12 @@ fn read_states(path: &str) -> Result<String> {
                 states.push(state.to_owned());
             });
     }
-    Ok(serde_json::to_string(&states)?)
+    // Serialize Vec<String> as JSON array of strings
+    let arr: Vec<JsonValue> = states.into_iter().map(JsonValue::Str).collect();
+    Ok(argus_json::serialize_value(&JsonValue::Array(arr)))
 }
 
-#[derive(Serialize_repr, Deserialize_repr, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(u8)]
 enum DmiStateDirCount {
     One = 1,
@@ -190,27 +199,123 @@ impl TryFrom<u8> for DmiStateDirCount {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct DmiState {
     name: String,
     dirs: DmiStateDirCount,
-    #[serde(default)]
     delay: Option<Vec<f32>>,
-    #[serde(default)]
     rewind: Option<u8>,
-    #[serde(default)]
     movement: Option<u8>,
-    #[serde(default)]
     loop_count: Option<NonZeroU32>,
-    #[serde(default)]
     hotspot: Option<(u32, u32, u32)>,
 }
 
-#[derive(Serialize, Deserialize)]
+impl DmiState {
+    fn to_json_value(&self) -> JsonValue {
+        let mut pairs = Vec::new();
+        pairs.push(("name".to_owned(), JsonValue::Str(self.name.clone())));
+        pairs.push(("dirs".to_owned(), JsonValue::Number(self.dirs as u8 as f64)));
+        if let Some(ref delay) = self.delay {
+            let arr: Vec<JsonValue> = delay.iter().map(|&d| JsonValue::Number(d as f64)).collect();
+            pairs.push(("delay".to_owned(), JsonValue::Array(arr)));
+        }
+        if let Some(rewind) = self.rewind {
+            pairs.push(("rewind".to_owned(), JsonValue::Number(rewind as f64)));
+        }
+        if let Some(movement) = self.movement {
+            pairs.push(("movement".to_owned(), JsonValue::Number(movement as f64)));
+        }
+        if let Some(loop_count) = self.loop_count {
+            pairs.push(("loop_count".to_owned(), JsonValue::Number(loop_count.get() as f64)));
+        }
+        if let Some((x, y, z)) = self.hotspot {
+            pairs.push(("hotspot".to_owned(), JsonValue::Array(vec![
+                JsonValue::Number(x as f64),
+                JsonValue::Number(y as f64),
+                JsonValue::Number(z as f64),
+            ])));
+        }
+        JsonValue::Object(pairs)
+    }
+
+    fn from_json(val: &JsonValue) -> std::result::Result<Self, Error> {
+        let name = val.get("name")
+            .and_then(|v| v.as_str())
+            .ok_or(Error::InvalidPngData)?
+            .to_owned();
+        let dirs_num = val.get("dirs")
+            .and_then(|v| v.as_i64())
+            .ok_or(Error::InvalidPngData)? as u8;
+        let dirs = DmiStateDirCount::try_from(dirs_num)
+            .map_err(|_| Error::InvalidPngData)?;
+        let delay = val.get("delay").and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter().map(|item| item.as_f64().unwrap_or(0.0) as f32).collect()
+            })
+        });
+        let rewind = val.get("rewind").and_then(|v| v.as_i64()).map(|n| n as u8);
+        let movement = val.get("movement").and_then(|v| v.as_i64()).map(|n| n as u8);
+        let loop_count = val.get("loop_count")
+            .and_then(|v| v.as_i64())
+            .and_then(|n| NonZeroU32::new(n as u32));
+        let hotspot = val.get("hotspot").and_then(|v| {
+            v.as_array().and_then(|arr| {
+                if arr.len() == 3 {
+                    Some((
+                        arr[0].as_i64().unwrap_or(0) as u32,
+                        arr[1].as_i64().unwrap_or(0) as u32,
+                        arr[2].as_i64().unwrap_or(0) as u32,
+                    ))
+                } else {
+                    None
+                }
+            })
+        });
+        Ok(DmiState {
+            name,
+            dirs,
+            delay,
+            rewind,
+            movement,
+            loop_count,
+            hotspot,
+        })
+    }
+}
+
 struct DmiMetadata {
     width: u32,
     height: u32,
     states: Vec<DmiState>,
+}
+
+impl DmiMetadata {
+    fn to_json_string(&self) -> String {
+        let states_arr: Vec<JsonValue> = self.states.iter().map(|s| s.to_json_value()).collect();
+        let val = JsonValue::Object(vec![
+            ("width".to_owned(), JsonValue::Number(self.width as f64)),
+            ("height".to_owned(), JsonValue::Number(self.height as f64)),
+            ("states".to_owned(), JsonValue::Array(states_arr)),
+        ]);
+        argus_json::serialize_value(&val)
+    }
+
+    fn from_json(src: &str) -> std::result::Result<Self, Error> {
+        let val = argus_json::parse_value(src.as_bytes()).map_err(|_| Error::InvalidPngData)?;
+        let width = val.get("width")
+            .and_then(|v| v.as_i64())
+            .ok_or(Error::InvalidPngData)? as u32;
+        let height = val.get("height")
+            .and_then(|v| v.as_i64())
+            .ok_or(Error::InvalidPngData)? as u32;
+        let states_arr = val.get("states")
+            .and_then(|v| v.as_array())
+            .ok_or(Error::InvalidPngData)?;
+        let states: Vec<DmiState> = states_arr
+            .iter()
+            .map(DmiState::from_json)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(DmiMetadata { width, height, states })
+    }
 }
 
 fn read_metadata(path: &str) -> Result<String> {
@@ -242,14 +347,14 @@ fn read_metadata(path: &str) -> Result<String> {
             })
             .collect::<Result<Vec<DmiState>>>()?,
     };
-    Ok(serde_json::to_string(&metadata)?)
+    Ok(metadata.to_json_string())
 }
 
 fn inject_metadata(path: &str, metadata: &str) -> Result<()> {
     let read_file = File::open(path).map(BufReader::new)?;
     let decoder = png::Decoder::new(read_file);
     let mut reader = decoder.read_info().map_err(|_| Error::InvalidPngData)?;
-    let new_dmi_metadata: DmiMetadata = serde_json::from_str(metadata)?;
+    let new_dmi_metadata = DmiMetadata::from_json(metadata)?;
     let mut new_metadata_string = String::new();
     writeln!(new_metadata_string, "# BEGIN DMI")?;
     writeln!(new_metadata_string, "version = 4.0")?;
@@ -318,6 +423,201 @@ byond_fn!(fn create_qr_code_png(path, data) {
         Err(err) => Some(format!("Error: Could not write QR code image to path: {err}"))
     }
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::argus_json;
+    use std::num::NonZeroU32;
+
+    #[test]
+    fn test_dmi_state_dir_count_valid() {
+        assert!(matches!(DmiStateDirCount::try_from(1), Ok(DmiStateDirCount::One)));
+        assert!(matches!(DmiStateDirCount::try_from(4), Ok(DmiStateDirCount::Four)));
+        assert!(matches!(DmiStateDirCount::try_from(8), Ok(DmiStateDirCount::Eight)));
+    }
+
+    #[test]
+    fn test_dmi_state_dir_count_invalid() {
+        assert!(matches!(DmiStateDirCount::try_from(0), Err(0)));
+        assert!(matches!(DmiStateDirCount::try_from(2), Err(2)));
+        assert!(matches!(DmiStateDirCount::try_from(3), Err(3)));
+        assert!(matches!(DmiStateDirCount::try_from(5), Err(5)));
+        assert!(matches!(DmiStateDirCount::try_from(16), Err(16)));
+    }
+
+    #[test]
+    fn test_dmi_state_to_json_minimal() {
+        let state = DmiState {
+            name: "idle".to_owned(),
+            dirs: DmiStateDirCount::One,
+            delay: None,
+            rewind: None,
+            movement: None,
+            loop_count: None,
+            hotspot: None,
+        };
+        let json_val = state.to_json_value();
+        assert_eq!(json_val.get("name").unwrap().as_str(), Some("idle"));
+        assert_eq!(json_val.get("dirs").unwrap().as_i64(), Some(1));
+        assert!(json_val.get("delay").is_none());
+        assert!(json_val.get("rewind").is_none());
+        assert!(json_val.get("movement").is_none());
+        assert!(json_val.get("loop_count").is_none());
+        assert!(json_val.get("hotspot").is_none());
+    }
+
+    #[test]
+    fn test_dmi_state_to_json_full() {
+        let state = DmiState {
+            name: "walk".to_owned(),
+            dirs: DmiStateDirCount::Four,
+            delay: Some(vec![1.0, 2.0, 3.0]),
+            rewind: Some(1),
+            movement: Some(1),
+            loop_count: NonZeroU32::new(5),
+            hotspot: Some((10, 20, 1)),
+        };
+        let json_val = state.to_json_value();
+        assert_eq!(json_val.get("name").unwrap().as_str(), Some("walk"));
+        assert_eq!(json_val.get("dirs").unwrap().as_i64(), Some(4));
+        let delay_arr = json_val.get("delay").unwrap().as_array().unwrap();
+        assert_eq!(delay_arr.len(), 3);
+        assert_eq!(delay_arr[0].as_f64(), Some(1.0));
+        assert_eq!(json_val.get("rewind").unwrap().as_i64(), Some(1));
+        assert_eq!(json_val.get("movement").unwrap().as_i64(), Some(1));
+        assert_eq!(json_val.get("loop_count").unwrap().as_i64(), Some(5));
+        let hotspot = json_val.get("hotspot").unwrap().as_array().unwrap();
+        assert_eq!(hotspot.len(), 3);
+        assert_eq!(hotspot[0].as_i64(), Some(10));
+    }
+
+    #[test]
+    fn test_dmi_state_roundtrip() {
+        let state = DmiState {
+            name: "test_state".to_owned(),
+            dirs: DmiStateDirCount::Eight,
+            delay: Some(vec![0.5, 1.0]),
+            rewind: Some(1),
+            movement: None,
+            loop_count: NonZeroU32::new(3),
+            hotspot: Some((5, 10, 1)),
+        };
+        let json_val = state.to_json_value();
+        let reconstructed = DmiState::from_json(&json_val).unwrap();
+        assert_eq!(reconstructed.name, "test_state");
+        assert_eq!(reconstructed.dirs as u8, 8);
+        assert_eq!(reconstructed.delay.as_ref().unwrap().len(), 2);
+        assert_eq!(reconstructed.rewind, Some(1));
+        assert!(reconstructed.movement.is_none());
+        assert_eq!(reconstructed.loop_count.unwrap().get(), 3);
+        assert_eq!(reconstructed.hotspot, Some((5, 10, 1)));
+    }
+
+    #[test]
+    fn test_dmi_state_from_json_missing_name() {
+        let val = argus_json::parse_value(b"{\"dirs\":1}").unwrap();
+        assert!(DmiState::from_json(&val).is_err());
+    }
+
+    #[test]
+    fn test_dmi_state_from_json_missing_dirs() {
+        let val = argus_json::parse_value(b"{\"name\":\"test\"}").unwrap();
+        assert!(DmiState::from_json(&val).is_err());
+    }
+
+    #[test]
+    fn test_dmi_state_from_json_invalid_dirs() {
+        let val = argus_json::parse_value(b"{\"name\":\"test\",\"dirs\":3}").unwrap();
+        assert!(DmiState::from_json(&val).is_err());
+    }
+
+    #[test]
+    fn test_dmi_metadata_roundtrip() {
+        let metadata = DmiMetadata {
+            width: 32,
+            height: 32,
+            states: vec![
+                DmiState {
+                    name: "idle".to_owned(),
+                    dirs: DmiStateDirCount::One,
+                    delay: None,
+                    rewind: None,
+                    movement: None,
+                    loop_count: None,
+                    hotspot: None,
+                },
+                DmiState {
+                    name: "walk".to_owned(),
+                    dirs: DmiStateDirCount::Four,
+                    delay: Some(vec![1.0, 1.0, 1.0, 1.0]),
+                    rewind: None,
+                    movement: Some(1),
+                    loop_count: None,
+                    hotspot: None,
+                },
+            ],
+        };
+        let json_str = metadata.to_json_string();
+        let reconstructed = DmiMetadata::from_json(&json_str).unwrap();
+        assert_eq!(reconstructed.width, 32);
+        assert_eq!(reconstructed.height, 32);
+        assert_eq!(reconstructed.states.len(), 2);
+        assert_eq!(reconstructed.states[0].name, "idle");
+        assert_eq!(reconstructed.states[0].dirs as u8, 1);
+        assert_eq!(reconstructed.states[1].name, "walk");
+        assert_eq!(reconstructed.states[1].dirs as u8, 4);
+        assert_eq!(reconstructed.states[1].movement, Some(1));
+    }
+
+    #[test]
+    fn test_dmi_metadata_from_json_missing_width() {
+        assert!(DmiMetadata::from_json("{\"height\":32,\"states\":[]}").is_err());
+    }
+
+    #[test]
+    fn test_dmi_metadata_from_json_missing_height() {
+        assert!(DmiMetadata::from_json("{\"width\":32,\"states\":[]}").is_err());
+    }
+
+    #[test]
+    fn test_dmi_metadata_from_json_missing_states() {
+        assert!(DmiMetadata::from_json("{\"width\":32,\"height\":32}").is_err());
+    }
+
+    #[test]
+    fn test_dmi_metadata_from_json_invalid_json() {
+        assert!(DmiMetadata::from_json("not json at all").is_err());
+    }
+
+    #[test]
+    fn test_dmi_metadata_empty_states() {
+        let json = "{\"width\":32,\"height\":32,\"states\":[]}";
+        let metadata = DmiMetadata::from_json(json).unwrap();
+        assert_eq!(metadata.width, 32);
+        assert_eq!(metadata.height, 32);
+        assert!(metadata.states.is_empty());
+    }
+
+    #[test]
+    fn test_dmi_state_from_json_optional_fields_absent() {
+        let val = argus_json::parse_value(b"{\"name\":\"s\",\"dirs\":1}").unwrap();
+        let state = DmiState::from_json(&val).unwrap();
+        assert!(state.delay.is_none());
+        assert!(state.rewind.is_none());
+        assert!(state.movement.is_none());
+        assert!(state.loop_count.is_none());
+        assert!(state.hotspot.is_none());
+    }
+
+    #[test]
+    fn test_dmi_state_hotspot_wrong_length() {
+        // Hotspot array with 2 elements instead of 3 should yield None
+        let val = argus_json::parse_value(b"{\"name\":\"s\",\"dirs\":1,\"hotspot\":[1,2]}").unwrap();
+        let state = DmiState::from_json(&val).unwrap();
+        assert!(state.hotspot.is_none());
+    }
+}
 
 byond_fn!(fn create_qr_code_svg(data) {
     let code = match QrCode::new(data.as_bytes()) {

@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-thread_local!( static INSTANTS: RefCell<HashMap<String, Instant>> = RefCell::new(HashMap::new()) );
+thread_local!( static INSTANTS: RefCell<HashMap<String, Instant>> = RefCell::new(HashMap::with_capacity(16)) );
 
 byond_fn!(fn time_microseconds(instant_id) {
     INSTANTS.with(|instants| {
@@ -37,15 +37,17 @@ byond_fn!(fn time_reset(instant_id) {
     })
 });
 
+byond_fn!(fn time_delete(instant_id) {
+    INSTANTS.with(|instants| instants.borrow_mut().remove(instant_id));
+    Some("")
+});
+
 byond_fn!(
     fn unix_timestamp() {
-        Some(format!(
-            "{:.6}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64()
-        ))
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| format!("{:.6}", d.as_secs_f64()))
     }
 );
 
@@ -54,6 +56,62 @@ byond_fn!(
         format_timestamp(format, offset)
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_timestamp_local() {
+        let result = format_timestamp("%Y-%m-%d", "");
+        assert!(result.is_some());
+        let s = result.unwrap();
+        // Should be in YYYY-MM-DD format
+        assert_eq!(s.len(), 10);
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+    }
+
+    #[test]
+    fn test_format_timestamp_utc_offset_zero() {
+        let result = format_timestamp("%H:%M", "0");
+        assert!(result.is_some());
+        let s = result.unwrap();
+        assert!(s.contains(':'));
+    }
+
+    #[test]
+    fn test_format_timestamp_positive_offset() {
+        let result = format_timestamp("%Y", "5");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_format_timestamp_negative_offset() {
+        let result = format_timestamp("%Y", "-8");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_format_timestamp_invalid_offset() {
+        let result = format_timestamp("%Y", "not_a_number");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_format_timestamp_extreme_offset() {
+        // Offset of 25 hours -> 90000 seconds, which exceeds FixedOffset bounds
+        let result = format_timestamp("%Y", "25");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_format_timestamp_various_formats() {
+        assert!(format_timestamp("%Y-%m-%d %H:%M:%S", "").is_some());
+        assert!(format_timestamp("%s", "").is_some()); // unix timestamp
+        assert!(format_timestamp("no format specifiers", "").is_some());
+    }
+}
 
 fn format_timestamp(format: &str, offset: &str) -> Option<String> {
     if offset.is_empty() {

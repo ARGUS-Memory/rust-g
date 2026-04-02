@@ -1,14 +1,16 @@
+use crate::argus_json::escape_json_string;
 use redis::{Client, Commands, RedisError};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 const ERROR_CHANNEL: &str = "RUSTG_REDIS_ERROR_CHANNEL";
 
 thread_local! {
-    static REQUEST_SENDER: RefCell<Option<flume::Sender<PubSubRequest>>> = const { RefCell::new(None) };
-    static RESPONSE_RECEIVER: RefCell<Option<flume::Receiver<PubSubResponse>>> = const { RefCell::new(None) };
+    static REQUEST_SENDER: RefCell<Option<mpsc::SyncSender<PubSubRequest>>> = const { RefCell::new(None) };
+    static RESPONSE_RECEIVER: RefCell<Option<mpsc::Receiver<PubSubResponse>>> = const { RefCell::new(None) };
 }
 
 enum PubSubRequest {
@@ -24,8 +26,8 @@ enum PubSubResponse {
 
 fn handle_redis_inner(
     client: Client,
-    control: &flume::Receiver<PubSubRequest>,
-    out: &flume::Sender<PubSubResponse>,
+    control: &mpsc::Receiver<PubSubRequest>,
+    out: &mpsc::SyncSender<PubSubResponse>,
 ) -> Result<(), RedisError> {
     let mut conn = client.get_connection()?;
     let mut pub_conn = client.get_connection()?;
@@ -44,8 +46,8 @@ fn handle_redis_inner(
                         () = pub_conn.publish(&channel, &message)?;
                     }
                 },
-                Err(flume::TryRecvError::Empty) => break,
-                Err(flume::TryRecvError::Disconnected) => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
             }
         }
 
@@ -60,8 +62,11 @@ fn handle_redis_inner(
             }
         } {
             let chan = msg.get_channel_name().to_owned();
-            let data: String = msg.get_payload().unwrap_or_default();
-            if let Err(flume::TrySendError::Disconnected(_)) =
+            let data: String = match msg.get_payload::<String>() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Err(mpsc::TrySendError::Disconnected(_)) =
                 out.try_send(PubSubResponse::Message(chan, data))
             {
                 return Ok(()); // If no one wants to receive any more messages from us, we exit this thread
@@ -72,8 +77,8 @@ fn handle_redis_inner(
 
 fn handle_redis(
     client: Client,
-    control: flume::Receiver<PubSubRequest>,
-    out: flume::Sender<PubSubResponse>,
+    control: mpsc::Receiver<PubSubRequest>,
+    out: mpsc::SyncSender<PubSubResponse>,
 ) {
     if let Err(e) = handle_redis_inner(client, &control, &out) {
         let _ = out.send(PubSubResponse::Disconnected(e.to_string()));
@@ -83,8 +88,8 @@ fn handle_redis(
 fn connect(addr: &str) -> Result<(), RedisError> {
     let client = redis::Client::open(addr)?;
     let _ = client.get_connection_with_timeout(Duration::from_secs(1))?;
-    let (c_sender, c_receiver) = flume::bounded(1000);
-    let (o_sender, o_receiver) = flume::bounded(1000);
+    let (c_sender, c_receiver) = mpsc::sync_channel(1000);
+    let (o_sender, o_receiver) = mpsc::sync_channel(1000);
     REQUEST_SENDER.with(|cell| cell.replace(Some(c_sender)));
     RESPONSE_RECEIVER.with(|cell| cell.replace(Some(o_receiver)));
     thread::spawn(|| handle_redis(client, c_receiver, o_sender));
@@ -151,7 +156,31 @@ fn get_messages() -> String {
         }
     });
 
-    serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_owned())
+    // Serialize HashMap<String, Vec<String>> as JSON object
+    // Each value is an array of strings
+    let mut out = String::with_capacity(result.len() * 64);
+    out.push('{');
+    let mut first = true;
+    for (key, values) in &result {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push('"');
+        escape_json_string(key, &mut out);
+        out.push_str("\":[");
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            escape_json_string(v, &mut out);
+            out.push('"');
+        }
+        out.push(']');
+    }
+    out.push('}');
+    out
 }
 
 byond_fn!(fn redis_connect(addr) {

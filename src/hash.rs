@@ -1,7 +1,7 @@
+use crate::argus_json::escape_json_string;
 use crate::error::{Error, Result};
-use base64::Engine;
-use const_random::const_random;
-const XXHASH_SEED: u64 = const_random!(u64);
+// Fixed seed for xxh64 — deterministic per-build. Change if you need a different distribution.
+const XXHASH_SEED: u64 = 0xA1B2_C3D4_E5F6_0718;
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use rand::{Rng, RngExt, distr::Alphanumeric};
@@ -18,6 +18,202 @@ use std::{
 };
 use twox_hash::XxHash64;
 
+/// Encode bytes as lowercase hex string. Replaces the `hex` crate.
+fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// Encode bytes as standard base64 (A-Z, a-z, 0-9, +, /) with = padding.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let chunks = data.chunks_exact(3);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        let n = (chunk[0] as u32) << 16 | (chunk[1] as u32) << 8 | (chunk[2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(n & 0x3F) as usize] as char);
+    }
+    match remainder.len() {
+        1 => {
+            let n = (remainder[0] as u32) << 16;
+            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = (remainder[0] as u32) << 16 | (remainder[1] as u32) << 8;
+            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Decode a standard base64 string. Returns None on invalid input.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    #[inline]
+    fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let input = s.as_bytes();
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+    // Standard base64 requires total length to be a multiple of 4
+    if input.len() % 4 != 0 {
+        return None;
+    }
+    // Count and validate padding (0, 1, or 2 trailing '=' chars only)
+    let pad_count = input.iter().rev().take_while(|&&b| b == b'=').count();
+    if pad_count > 2 {
+        return None;
+    }
+    let data_end = input.len() - pad_count;
+    // Validate all non-padding chars are valid base64
+    if input[..data_end].iter().any(|&b| decode_char(b).is_none()) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(data_end * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+
+    for &b in &input[..data_end] {
+        let val = decode_char(b)?;
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Encode bytes as RFC 4648 base32 (A-Z, 2-7). Optionally pads with '='.
+fn base32_encode(data: &[u8], pad: bool) -> String {
+    const ALPHA: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::with_capacity((data.len() + 4) / 5 * 8);
+    for chunk in data.chunks(5) {
+        let mut buf = [0u8; 5];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        let n = chunk.len();
+        let emit = match n {
+            1 => 2,
+            2 => 4,
+            3 => 5,
+            4 => 7,
+            _ => 8,
+        };
+        let bits: u64 = (buf[0] as u64) << 32
+            | (buf[1] as u64) << 24
+            | (buf[2] as u64) << 16
+            | (buf[3] as u64) << 8
+            | (buf[4] as u64);
+        for i in 0..emit {
+            let idx = ((bits >> (35 - i * 5)) & 0x1F) as usize;
+            out.push(ALPHA[idx] as char);
+        }
+        if pad {
+            let pad_count = 8 - emit;
+            for _ in 0..pad_count {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Decode RFC 4648 base32. Accepts both padded and unpadded input (case-insensitive).
+/// Returns None on invalid input.
+fn base32_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim_end_matches('=');
+    if s.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    for chunk in s.as_bytes().chunks(8) {
+        let mut buf = [0u8; 8];
+        let n = chunk.len();
+        for i in 0..n {
+            let b = chunk[i];
+            buf[i] = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a',
+                b'2'..=b'7' => b - b'2' + 26,
+                _ => return None,
+            };
+        }
+        let bits: u64 = (buf[0] as u64) << 35
+            | (buf[1] as u64) << 30
+            | (buf[2] as u64) << 25
+            | (buf[3] as u64) << 20
+            | (buf[4] as u64) << 15
+            | (buf[5] as u64) << 10
+            | (buf[6] as u64) << 5
+            | (buf[7] as u64);
+        let byte_count = match n {
+            2 => 1,
+            4 => 2,
+            5 => 3,
+            7 => 4,
+            8 => 5,
+            _ => return None,
+        };
+        for i in 0..byte_count {
+            out.push((bits >> (32 - i * 8)) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Decode hex string into a byte slice. Returns Err if input length is wrong or chars are invalid.
+pub(crate) fn hex_decode_to_slice(hex: &str, out: &mut [u8]) -> std::result::Result<(), String> {
+    if hex.len() != out.len() * 2 {
+        return Err(format!("invalid hex length: expected {}, got {}", out.len() * 2, hex.len()));
+    }
+    let bytes = hex.as_bytes();
+    for i in 0..out.len() {
+        let hi = hex_nibble(bytes[i * 2]).ok_or_else(|| format!("invalid hex char at {}", i * 2))?;
+        let lo = hex_nibble(bytes[i * 2 + 1]).ok_or_else(|| format!("invalid hex char at {}", i * 2 + 1))?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(())
+}
+
+#[inline]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 const TOTP_DIGITS: usize = 6;
 const TOTP_STEP_SECONDS: u64 = 30;
 const DIGITS_POWER: [u32; 9] = [
@@ -29,11 +225,12 @@ byond_fn!(fn hash_string(algorithm, string) {
 });
 
 byond_fn!(fn decode_base64(string) {
-    base64::prelude::BASE64_STANDARD.decode(string).ok()
+    base64_decode(string)
 });
 
-byond_fn!(fn decode_base32(string, padding) {
-    base32::decode(base32::Alphabet::Rfc4648 { padding: padding == "1" }, string)
+byond_fn!(fn decode_base32(string, _padding) {
+    // padding param kept for BYOND API compat; decoder accepts both padded and unpadded
+    base32_decode(string)
 });
 
 byond_fn!(fn hash_file(algorithm, string) {
@@ -96,22 +293,22 @@ fn format_rng<T: Rng>(rng: &mut T, format: &str, n_bytes: usize) -> String {
         "hex" => {
             let mut bytes = vec![0u8; n_bytes];
             rng.fill_bytes(&mut bytes);
-            hex::encode(bytes)
+            hex_encode(bytes)
         }
         "base32_rfc4648" => {
             let mut bytes = vec![0u8; n_bytes];
             rng.fill_bytes(&mut bytes);
-            base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &bytes)
+            base32_encode(&bytes, false)
         }
         "base32_rfc4648_pad" => {
             let mut bytes = vec![0u8; n_bytes];
             rng.fill_bytes(&mut bytes);
-            base32::encode(base32::Alphabet::Rfc4648 { padding: true }, &bytes)
+            base32_encode(&bytes, true)
         }
         "base64" => {
             let mut bytes = vec![0u8; n_bytes];
             rng.fill_bytes(&mut bytes);
-            base64::prelude::BASE64_STANDARD.encode(bytes)
+            base64_encode(&bytes)
         }
         _ => String::from("ERROR: Invalid format"),
     }
@@ -168,16 +365,28 @@ fn totp_generate_tolerance(
         let result = totp_generate(algorithm, base32_seed, i.into(), digits, time_override)?;
         results.push(result)
     }
-    Ok(serde_json::to_string(&results)?)
+    // Serialize Vec<String> as JSON array: ["a","b","c"]
+    let mut out = String::with_capacity(results.len() * 12);
+    out.push('[');
+    for (i, s) in results.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        escape_json_string(s, &mut out);
+        out.push('"');
+    }
+    out.push(']');
+    Ok(out)
 }
 
-fn hmac<D>(seed: &[u8], data: &[u8]) -> Vec<u8>
+fn hmac<D>(seed: &[u8], data: &[u8]) -> Result<Vec<u8>>
 where
     D: Mac + hmac::digest::KeyInit,
 {
-    let mut mac = <D as Mac>::new_from_slice(seed).unwrap();
+    let mut mac = <D as Mac>::new_from_slice(seed).map_err(|_| Error::BadSeed)?;
     mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 /// Generates a single TOTP code from base32_seed offset by offset time steps
@@ -200,7 +409,7 @@ fn totp_generate(
     }
 
     // Always accept padding
-    match base32::decode(base32::Alphabet::Rfc4648 { padding: true }, base32_seed) {
+    match base32_decode(base32_seed) {
         Some(base32_bytes) => {
             if base32_bytes.len() < 10 || base32_bytes.len() > 64 {
                 return Err(Error::BadSeed);
@@ -220,16 +429,18 @@ fn totp_generate(
     let time_bytes: [u8; 8] = time.to_be_bytes();
 
     let hmac_bytes: Vec<u8> = match algorithm {
-        "sha1" => hmac::<Hmac<Sha1>>(&seed, &time_bytes),
-        "sha256" => hmac::<Hmac<Sha256>>(&seed, &time_bytes),
-        "sha512" => hmac::<Hmac<Sha512>>(&seed, &time_bytes),
+        "sha1" => hmac::<Hmac<Sha1>>(&seed, &time_bytes)?,
+        "sha256" => hmac::<Hmac<Sha256>>(&seed, &time_bytes)?,
+        "sha512" => hmac::<Hmac<Sha512>>(&seed, &time_bytes)?,
         _ => return Err(Error::InvalidAlgorithm),
     };
 
-    let totp_byte_offset: usize = (hmac_bytes.last().unwrap() & 0x0F) as usize;
-    let totp_bytes: [u8; 4] = hmac_bytes[totp_byte_offset..(totp_byte_offset + 4)]
+    let totp_byte_offset: usize = (*hmac_bytes.last().ok_or(Error::InvalidAlgorithm)? & 0x0F) as usize;
+    let totp_bytes: [u8; 4] = hmac_bytes
+        .get(totp_byte_offset..totp_byte_offset + 4)
+        .ok_or(Error::InvalidAlgorithm)?
         .try_into()
-        .unwrap();
+        .map_err(|_| Error::InvalidAlgorithm)?;
     let totp_untruncated: u32 = u32::from_be_bytes(totp_bytes);
     let totp_sized_code: u32 = (totp_untruncated & 0x7FFFFFFF) % DIGITS_POWER[digits];
     // Pad the digits in constant time to reduce effectiveness of timing attacks
@@ -285,18 +496,14 @@ impl HashDispatcher {
 
     fn finish(self) -> String {
         match self {
-            HashDispatcher::Md5(hasher) => hex::encode(hasher.finalize()),
-            HashDispatcher::Sha1(hasher) => hex::encode(hasher.finalize()),
-            HashDispatcher::Sha256(hasher) => hex::encode(hasher.finalize()),
-            HashDispatcher::Sha512(hasher) => hex::encode(hasher.finalize()),
+            HashDispatcher::Md5(hasher) => hex_encode(hasher.finalize()),
+            HashDispatcher::Sha1(hasher) => hex_encode(hasher.finalize()),
+            HashDispatcher::Sha256(hasher) => hex_encode(hasher.finalize()),
+            HashDispatcher::Sha512(hasher) => hex_encode(hasher.finalize()),
             HashDispatcher::Xxh64(hasher) => format!("{:x}", hasher.finish()),
-            HashDispatcher::Base32(buffer) => {
-                base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &buffer)
-            }
-            HashDispatcher::Base32Pad(buffer) => {
-                base32::encode(base32::Alphabet::Rfc4648 { padding: true }, &buffer)
-            }
-            HashDispatcher::Base64(buffer) => base64::prelude::BASE64_STANDARD.encode(&buffer),
+            HashDispatcher::Base32(buffer) => base32_encode(&buffer, false),
+            HashDispatcher::Base32Pad(buffer) => base32_encode(&buffer, true),
+            HashDispatcher::Base64(buffer) => base64_encode(&buffer),
         }
     }
 }
@@ -342,10 +549,7 @@ mod tests {
                     .for_each(|(algo_idx, (algo, seed))| {
                         let totp = totp_generate(
                             algo,
-                            &base32::encode(
-                                base32::Alphabet::Rfc4648 { padding: false }, // test it unpadded
-                                seed.as_bytes(),
-                            ),
+                            &base32_encode(seed.as_bytes(), false), // test it unpadded
                             0,
                             8,
                             Some(*time),
@@ -406,5 +610,146 @@ mod tests {
         assert!(err_result.is_err());
         let err_result = totp_generate_tolerance("invalid", "XE7ZREYZTLXYK444", 0, 6, None);
         assert!(err_result.is_err());
+    }
+
+    // --- Additional hash tests for optimization coverage ---
+
+    #[test]
+    fn test_string_hash_algorithms() {
+        // Known MD5 of empty string
+        assert_eq!(string_hash("md5", "").unwrap(), "d41d8cd98f00b204e9800998ecf8427e");
+        // Known SHA1 of empty string
+        assert_eq!(string_hash("sha1", "").unwrap(), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        // Known SHA256 of empty string
+        assert_eq!(string_hash("sha256", "").unwrap(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[test]
+    fn test_string_hash_sha512() {
+        let result = string_hash("sha512", "test").unwrap();
+        assert_eq!(result.len(), 128); // SHA512 produces 64 bytes = 128 hex chars
+    }
+
+    #[test]
+    fn test_string_hash_invalid_algorithm() {
+        assert!(string_hash("invalid", "test").is_err());
+    }
+
+    #[test]
+    fn test_string_hash_xxh64_fixed_deterministic() {
+        let h1 = string_hash("xxh64_fixed", "hello").unwrap();
+        let h2 = string_hash("xxh64_fixed", "hello").unwrap();
+        assert_eq!(h1, h2);
+        // Different input should produce different hash
+        let h3 = string_hash("xxh64_fixed", "world").unwrap();
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_string_hash_base32() {
+        let result = string_hash("base32_rfc4648", "hello").unwrap();
+        assert!(!result.is_empty());
+        // base32 should only contain A-Z and 2-7
+        assert!(result.chars().all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)));
+    }
+
+    #[test]
+    fn test_string_hash_base32_pad() {
+        let result = string_hash("base32_rfc4648_pad", "hi").unwrap();
+        assert!(!result.is_empty());
+        // Padded base32 may contain '=' padding
+        assert!(result.chars().all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c) || c == '='));
+    }
+
+    #[test]
+    fn test_string_hash_base64() {
+        let result = string_hash("base64", "hello").unwrap();
+        assert_eq!(result, "aGVsbG8=");
+    }
+
+    #[test]
+    fn test_hash_dispatcher_md5_known() {
+        let result = string_hash("md5", "The quick brown fox jumps over the lazy dog").unwrap();
+        assert_eq!(result, "9e107d9d372bb6826bd81d3542a419d6");
+    }
+
+    #[test]
+    fn test_gen_prng_chacha20_seeded_deterministic() {
+        let r1 = gen_prng_chacha20_seeded("hex", 16, "seed123");
+        let r2 = gen_prng_chacha20_seeded("hex", 16, "seed123");
+        assert_eq!(r1, r2);
+        // Different seed should produce different output
+        let r3 = gen_prng_chacha20_seeded("hex", 16, "seed456");
+        assert_ne!(r1, r3);
+    }
+
+    #[test]
+    fn test_format_rng_alphanumeric() {
+        let result = gen_prng_chacha20_seeded("alphanumeric", 32, "test_seed");
+        assert_eq!(result.len(), 32);
+        assert!(result.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn test_format_rng_hex() {
+        let result = gen_prng_chacha20_seeded("hex", 16, "test_seed");
+        assert_eq!(result.len(), 32); // 16 bytes = 32 hex chars
+        assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_format_rng_invalid() {
+        let result = gen_prng_chacha20_seeded("invalid_format", 8, "seed");
+        assert_eq!(result, "ERROR: Invalid format");
+    }
+
+    #[test]
+    fn test_totp_zero_digits() {
+        let result = totp_generate("sha1", "XE7ZREYZTLXYK444", 0, 0, Some(1000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_totp_nine_digits() {
+        let result = totp_generate("sha1", "XE7ZREYZTLXYK444", 0, 9, Some(1000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_totp_seed_too_short() {
+        // Less than 10 bytes decoded
+        let short_seed = base32_encode(b"12345678", false);
+        let result = totp_generate("sha1", &short_seed, 0, 6, Some(1000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_totp_seed_too_long() {
+        // More than 64 bytes decoded
+        let long_data = vec![0x42u8; 65];
+        let long_seed = base32_encode(&long_data, false);
+        let result = totp_generate("sha1", &long_seed, 0, 6, Some(1000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_totp_invalid_base32() {
+        let result = totp_generate("sha1", "!!!invalid!!!", 0, 6, Some(1000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_totp_sha256_and_sha512() {
+        // Just verify they produce valid 6-digit codes
+        let _seed = "JBSWY3DPEHPK3PXP"; // base32 of "Hello!" - too short (5 bytes)
+        // Use a longer one
+        let good_seed = base32_encode(b"12345678901234567890", false);
+        let r256 = totp_generate("sha256", &good_seed, 0, 6, Some(1000)).unwrap();
+        assert_eq!(r256.len(), 6);
+        assert!(r256.chars().all(|c| c.is_ascii_digit()));
+
+        let r512 = totp_generate("sha512", &good_seed, 0, 6, Some(1000)).unwrap();
+        assert_eq!(r512.len(), 6);
+        assert!(r512.chars().all(|c| c.is_ascii_digit()));
     }
 }

@@ -5,7 +5,7 @@ use super::{
 use crate::error::Error;
 use dmi::{dirs::Dirs, icon::IconState};
 use image::{Rgba, RgbaImage, imageops};
-use ordered_float::OrderedFloat;
+use super::ord_float::OrderedFloat;
 use rayon::{
     iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator},
     slice::ParallelSliceMut,
@@ -186,7 +186,7 @@ pub fn hex_to_rgba(hex_in: &String) -> Result<[u8; 4], Error> {
     if hex.len() == 6 {
         hex += "ff";
     }
-    if let Err(err) = hex::decode_to_slice(hex, &mut color) {
+    if let Err(err) = crate::hash::hex_decode_to_slice(&hex, &mut color) {
         return Err(Error::IconForge(format!(
             "Decoding hex color '{hex_in}' failed: {err}"
         )));

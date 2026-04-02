@@ -8,15 +8,15 @@
 mod byond;
 #[allow(dead_code)]
 mod error;
-
 #[cfg(feature = "jobs")]
 mod jobs;
 
 #[cfg(feature = "acreplace")]
 pub mod acreplace;
+pub mod argus_json;
 #[cfg(feature = "cellularnoise")]
 pub mod cellularnoise;
-#[cfg(feature = "dbpnoise")]
+#[cfg(feature = "batchnoise")]
 pub mod dbpnoise;
 #[cfg(feature = "dice")]
 pub mod dice;

@@ -3,7 +3,7 @@ use crate::error::Error;
 use dashmap::DashMap;
 use dmi::icon::{DmiVersion, Icon, IconState};
 use image::RgbaImage;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -87,7 +87,7 @@ struct GAGSData {
     config_icon: Arc<Icon>,
 }
 
-static GAGS_CACHE: Lazy<DashMap<String, GAGSData>> = Lazy::new(DashMap::new);
+static GAGS_CACHE: LazyLock<DashMap<String, GAGSData>> = LazyLock::new(DashMap::new);
 
 /// Loads a GAGS config and the requested DMIs into memory for use by iconforge_gags()
 pub fn load_gags_config(

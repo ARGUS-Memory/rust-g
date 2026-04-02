@@ -1,28 +1,27 @@
+use crate::argus_json::{self, JsonPart};
 use crate::{error::Result, jobs};
-use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 use std::io::Write;
 use std::time::Duration;
 
 // ----------------------------------------------------------------------------
 // Interface
 
-#[derive(Deserialize)]
 struct RequestOptions {
-    #[serde(default)]
     output_filename: Option<String>,
-    #[serde(default)]
     body_filename: Option<String>,
-    #[serde(default)]
     timeout_seconds: Option<u64>,
 }
 
-#[derive(Serialize)]
-struct Response<'a> {
-    status_code: u16,
-    headers: HashMap<String, String>,
-    body: Option<&'a str>,
+impl RequestOptions {
+    fn from_json(src: &str) -> std::result::Result<Self, ()> {
+        let val = argus_json::parse_value(src.as_bytes())?;
+        Ok(Self {
+            output_filename: val.get("output_filename").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+            body_filename: val.get("body_filename").and_then(|v| v.as_str()).map(|s| s.to_owned()),
+            timeout_seconds: val.get("timeout_seconds").and_then(|v| v.as_i64()).and_then(|n| u64::try_from(n).ok()),
+        })
+    }
 }
 
 // If the response can be deserialized -> success.
@@ -78,7 +77,7 @@ byond_fn!(fn http_check_request(id) {
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 
-pub static HTTP_CLIENT: Lazy<ureq::Agent> = Lazy::new(ureq::agent);
+pub static HTTP_CLIENT: LazyLock<ureq::Agent> = LazyLock::new(ureq::agent);
 
 // ----------------------------------------------------------------------------
 // Request construction and execution
@@ -109,15 +108,17 @@ fn construct_request(
     let mut final_body = body.as_bytes().to_vec();
 
     if !headers.is_empty() {
-        let headers: BTreeMap<&str, &str> = serde_json::from_str(headers)?;
-        for (key, value) in headers {
-            req = req.set(key, value);
+        let header_pairs = argus_json::parse_string_map(headers.as_bytes())
+            .map_err(|_| crate::error::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid headers JSON")))?;
+        for (key, value) in header_pairs {
+            req = req.set(&key, &value);
         }
     }
 
     let mut output_filename = None;
     if !options.is_empty() {
-        let options: RequestOptions = serde_json::from_str(options)?;
+        let options = RequestOptions::from_json(options)
+            .map_err(|_| crate::error::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid options JSON")))?;
         output_filename = options.output_filename;
         if let Some(fname) = options.body_filename {
             final_body = std::fs::read(fname)?;
@@ -135,32 +136,133 @@ fn construct_request(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_options_from_json_empty() {
+        let opts = RequestOptions::from_json("{}").unwrap();
+        assert!(opts.output_filename.is_none());
+        assert!(opts.body_filename.is_none());
+        assert!(opts.timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn test_request_options_from_json_all_fields() {
+        let opts = RequestOptions::from_json(
+            "{\"output_filename\":\"out.txt\",\"body_filename\":\"body.json\",\"timeout_seconds\":30}"
+        ).unwrap();
+        assert_eq!(opts.output_filename.as_deref(), Some("out.txt"));
+        assert_eq!(opts.body_filename.as_deref(), Some("body.json"));
+        assert_eq!(opts.timeout_seconds, Some(30));
+    }
+
+    #[test]
+    fn test_request_options_from_json_partial() {
+        let opts = RequestOptions::from_json("{\"timeout_seconds\":5}").unwrap();
+        assert!(opts.output_filename.is_none());
+        assert!(opts.body_filename.is_none());
+        assert_eq!(opts.timeout_seconds, Some(5));
+    }
+
+    #[test]
+    fn test_request_options_from_json_invalid() {
+        assert!(RequestOptions::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn test_request_options_from_json_wrong_types_ignored() {
+        // Non-string for output_filename should yield None
+        let opts = RequestOptions::from_json("{\"output_filename\":42}").unwrap();
+        assert!(opts.output_filename.is_none());
+    }
+
+    #[test]
+    fn test_construct_request_get() {
+        let prep = construct_request("get", "http://example.com", "", "", "").unwrap();
+        assert!(prep.output_filename.is_none());
+        assert!(prep.body.is_empty());
+    }
+
+    #[test]
+    fn test_construct_request_post_with_body() {
+        let prep = construct_request("post", "http://example.com", "hello", "", "").unwrap();
+        assert_eq!(prep.body, b"hello");
+    }
+
+    #[test]
+    fn test_construct_request_with_headers() {
+        let prep = construct_request(
+            "get", "http://example.com", "",
+            "{\"Content-Type\":\"application/json\",\"X-Custom\":\"value\"}", ""
+        ).unwrap();
+        assert!(prep.output_filename.is_none());
+    }
+
+    #[test]
+    fn test_construct_request_invalid_headers() {
+        let result = construct_request("get", "http://example.com", "", "not json", "");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_construct_request_with_options() {
+        let prep = construct_request(
+            "get", "http://example.com", "", "",
+            "{\"output_filename\":\"download.bin\",\"timeout_seconds\":10}"
+        ).unwrap();
+        assert_eq!(prep.output_filename.as_deref(), Some("download.bin"));
+    }
+
+    #[test]
+    fn test_construct_request_methods() {
+        // All valid methods should construct without error
+        for method in &["get", "post", "put", "patch", "delete", "head", "unknown"] {
+            let result = construct_request(method, "http://example.com", "", "", "");
+            assert!(result.is_ok(), "Failed for method: {}", method);
+        }
+    }
+}
+
 fn submit_request(prep: RequestPrep) -> Result<String> {
     let response = prep.req.send_bytes(&prep.body).map_err(Box::new)?;
 
-    let body;
-    let mut resp = Response {
-        status_code: response.status(),
-        headers: HashMap::new(),
-        body: None,
-    };
+    let status_code = response.status();
 
+    // Collect headers
+    let mut header_pairs: Vec<(&str, JsonPart<'_>)> = Vec::new();
+    let mut header_names: Vec<String> = Vec::new();
+    let mut header_values: Vec<String> = Vec::new();
     for key in response.headers_names() {
         let Some(value) = response.header(&key) else {
             continue;
         };
-
-        resp.headers.insert(key, value.to_owned());
+        header_names.push(key);
+        header_values.push(value.to_owned());
     }
+    for (k, v) in header_names.iter().zip(header_values.iter()) {
+        header_pairs.push((k.as_str(), JsonPart::Str(v.as_str())));
+    }
+    let headers_json = argus_json::json_obj_mixed(&header_pairs);
 
     if let Some(output_filename) = prep.output_filename {
         let mut writer = std::io::BufWriter::new(std::fs::File::create(output_filename)?);
         std::io::copy(&mut response.into_reader(), &mut writer)?;
         writer.flush()?;
-    } else {
-        body = response.into_string()?;
-        resp.body = Some(&body);
-    }
 
-    Ok(serde_json::to_string(&resp)?)
+        Ok(argus_json::json_obj_mixed(&[
+            ("status_code", JsonPart::Int(status_code as i64)),
+            ("headers", JsonPart::Raw(&headers_json)),
+            ("body", JsonPart::Null),
+        ]))
+    } else {
+        let body = response.into_string()?;
+
+        Ok(argus_json::json_obj_mixed(&[
+            ("status_code", JsonPart::Int(status_code as i64)),
+            ("headers", JsonPart::Raw(&headers_json)),
+            ("body", JsonPart::Str(&body)),
+        ]))
+    }
 }

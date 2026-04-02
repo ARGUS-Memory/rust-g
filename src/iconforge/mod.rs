@@ -13,5 +13,7 @@ pub mod icon_operations;
 pub mod image_cache;
 /// Spritesheet generation and cache validation functions
 pub mod spritesheet;
+/// Drop-in replacement for ordered_float::OrderedFloat<f32>
+pub mod ord_float;
 /// UniversalIcon data structure and utilities
 pub mod universal_icon;

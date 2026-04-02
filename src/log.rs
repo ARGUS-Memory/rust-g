@@ -3,7 +3,7 @@ use chrono::Utc;
 use std::{
     cell::RefCell,
     collections::hash_map::{Entry, HashMap},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     fs::{File, OpenOptions},
     io::Write,
@@ -42,6 +42,11 @@ byond_fn!(fn log_write(path, data, ...rest) {
 
         Ok(())
     }).err()
+});
+
+byond_fn!(fn log_close(path) {
+    FILE_MAP.with(|cell| cell.borrow_mut().remove(OsStr::new(path)));
+    Some("")
 });
 
 byond_fn!(

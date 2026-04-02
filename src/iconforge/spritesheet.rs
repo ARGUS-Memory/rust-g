@@ -12,7 +12,7 @@ use dashmap::{DashMap, DashSet};
 use dmi::icon::{DmiVersion, Icon, IconState};
 use image::RgbaImage;
 use indexmap::IndexMap;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 use std::{
@@ -27,7 +27,7 @@ use twox_hash::XxHash64;
 
 type SpriteJsonMap = HashMap<String, IndexMap<String, UniversalIcon>, BuildHasherDefault<XxHash64>>;
 /// This is used to save time decoding 'sprites' a second time between the cache step and the generate step.
-static SPRITES_TO_JSON: Lazy<Arc<Mutex<SpriteJsonMap>>> = Lazy::new(|| {
+static SPRITES_TO_JSON: LazyLock<Arc<Mutex<SpriteJsonMap>>> = LazyLock::new(|| {
     Arc::new(Mutex::new(HashMap::with_hasher(BuildHasherDefault::<
         XxHash64,
     >::default())))
@@ -344,7 +344,7 @@ pub fn generate_headless(file_path: &str, sprites: &str, flatten: &str) -> Headl
     }
 }
 
-static CREATED_DIRS: Lazy<DashSet<PathBuf>> = Lazy::new(DashSet::new);
+static CREATED_DIRS: LazyLock<DashSet<PathBuf>> = LazyLock::new(DashSet::new);
 
 fn ensure_dir_exists(path: PathBuf, error: &Arc<Mutex<Vec<String>>>) {
     if CREATED_DIRS.insert(path.clone())

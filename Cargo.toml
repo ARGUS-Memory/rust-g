@@ -13,7 +13,12 @@ description = "Offloaded task library for the /tg/ Space Station 13 codebase"
 rust-version = "1.89" # generally update this when doing a major version to T-6mo ago, update rust.yml
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bench]]
+name = "perf"
+harness = false
+required-features = ["allow_non_32bit"]
 
 [profile.release]
 opt-level = 3
@@ -22,33 +27,20 @@ lto = true
 debug = true
 
 [dependencies]
-thiserror = "2.0"
-flume = { version = "0.12", optional = true }
 chrono = { version = "0.4", optional = true }
-base64 = { version = "0.22", optional = true }
 md-5 = { version = "0.10", optional = true }
 twox-hash = { version = "2.1", optional = true }
-const-random = { version = "0.1.18", optional = true }
 sha-1 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
-hex = { version = "0.4", optional = true }
-percent-encoding = { version = "2.3", optional = true }
-url-dep = { version = "2.5", package = "url", optional = true }
 png = { version = "0.18", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = [
     "png",
 ] }
-gix = { version = "0.80", optional = true, default-features = false, features = [
-    "revision",
-    "max-performance-safe",
-] }
-noise = { version = "0.9", optional = true }
+# noise crate removed — 2D Perlin noise is now self-rolled in src/noise.rs
 redis = { version = "0.32", optional = true, features = ["ahash"] }
 ureq = { version = "2.12", optional = true }
 serde = { version = "1.0", optional = true, features = ["derive"] }
 serde_json = { version = "1.0", optional = true, features = ["preserve_order"] }
-serde_repr = { version = "0.1", optional = true }
-once_cell = { version = "1.21", optional = true }
 mysql = { git = "https://github.com/ZeWaka/rust-mysql-simple.git", tag = "v26.0.0", default-features = false, optional = true }
 dashmap = { version = "6.1", optional = true, features = ["rayon", "serde"] }
 zip = { version = "8.2", optional = true }
@@ -57,30 +49,21 @@ toml-dep = { version = "1.0.7", package = "toml", optional = true }
 aho-corasick = { version = "1.1", optional = true }
 rayon = { version = "1.11", optional = true }
 dbpnoise = { version = "0.1.2", optional = true }
-pathfinding = { version = "4.15", optional = true }
-num-integer = { version = "0.1.46", optional = true }
 dmi = { version = "0.5.0", optional = true }
 tracy_full = { version = "1.12.0", optional = true }
 ammonia = { version = "4.1", optional = true }
 fast_poisson = { version = "1.0.2", optional = true, features = [
     "single_precision",
 ] }
-symphonia = { version = "0.5.5", optional = true, features = ["all-codecs"] }
+symphonia = { version = "0.5.5", optional = true, default-features = false, features = ["mp3", "ogg", "vorbis", "pcm"] }
 caith = { version = "4.2.4", optional = true }
-uuid = { version = "1.22", optional = true, features = [
-    "v4",
-    "v7",
-    "fast-rng",
-] }
 cuid2 = { version = "0.1.4", optional = true }
 rand_chacha = { version = "0.10.0", optional = true }
 hmac = { version = "0.12.1", optional = true }
-base32 = { version = "0.5.1", optional = true }
 indexmap = { version = "2.13.0", optional = true, features = [
     "serde",
     "rayon",
 ] }
-ordered-float = { version = "5.1.0", optional = true, features = ["serde"] }
 qrcode = { version = "0.14.1", optional = true, features = ["image", "svg"]}
 
 [features]
@@ -142,25 +125,19 @@ all = [
 acreplace = ["aho-corasick"]
 batchnoise = ["dbpnoise"]
 cellularnoise = ["rand", "rayon"]
-dmi = ["png", "image", "qrcode", "serde_repr"]
+dmi = ["png", "image", "qrcode"]
 file = []
-git = ["gix", "chrono"]
+git = ["chrono"]
 hash = [
-    "base32",
-    "base64",
-    "const-random",
     "md-5",
-    "hex",
     "hmac",
     "rand",
     "rand_chacha",
     "sha-1",
     "sha2",
     "twox-hash",
-    "serde",
-    "serde_json",
 ]
-http = ["ureq", "serde", "serde_json", "once_cell", "jobs"]
+http = ["ureq", "jobs"]
 iconforge = [
     "dashmap",
     "dep:dmi",
@@ -168,8 +145,6 @@ iconforge = [
     "image",
     "indexmap",
     "jobs",
-    "once_cell",
-    "ordered-float",
     "png",
     "rayon",
     "serde",
@@ -177,22 +152,23 @@ iconforge = [
     "tracy_full",
     "twox-hash",
 ]
-json = ["serde", "serde_json"]
+json = []
 log = ["chrono"]
-sanitize = ["ammonia", "serde_json"]
+noise = []
+sanitize = ["ammonia"]
 sound_len = ["symphonia"]
-sql = ["mysql", "serde", "serde_json", "once_cell", "dashmap", "jobs"]
+sql = ["mysql", "dashmap", "jobs"]
 time = ["chrono"]
 toml = ["serde", "serde_json", "toml-dep"]
-url = ["url-dep", "percent-encoding"]
-uuid = ["dep:uuid", "cuid2"]
+url = []
+uuid = ["rand", "cuid2"]
 
 # additional features
 dice = ["caith"]
-pathfinder = ["num-integer", "pathfinding", "serde", "serde_json"]
+pathfinder = []
 poissonnoise = ["fast_poisson"]
-redis_pubsub = ["flume", "redis", "serde", "serde_json"]
-redis_reliablequeue = ["flume", "redis", "serde", "serde_json"]
+redis_pubsub = ["redis"]
+redis_reliablequeue = ["redis"]
 unzip = ["zip", "jobs"]
 worleynoise = ["rand", "rayon"]
 
@@ -201,8 +177,9 @@ native_tls = ["mysql/default", "mysql/native-tls"]
 rustls_tls = ["mysql/default-rust", "mysql/rustls-tls-ring"]
 
 # internal feature-like things
-jobs = ["flume"]
+jobs = []
 allow_non_32bit = []
 
 [dev-dependencies]
 regex = "1"
+criterion = { version = "0.5", features = ["html_reports"] }

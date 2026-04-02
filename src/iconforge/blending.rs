@@ -1,8 +1,8 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use serde::Serialize;
 use std::str::FromStr;
 
-pub static ALPHA_TABLE: Lazy<[u8; 256 * 256]> = Lazy::new(|| {
+pub static ALPHA_TABLE: LazyLock<[u8; 256 * 256]> = LazyLock::new(|| {
     let mut table = [0u8; 256 * 256];
 
     for dst in 0..256 {

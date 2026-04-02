@@ -18,7 +18,7 @@ thread_local! {
 }
 
 pub unsafe fn parse_args<'a>(argc: c_int, argv: *const *const c_char) -> Vec<Cow<'a, str>> {
-    if argc == 0 || argv.is_null() {
+    if argc <= 0 || argv.is_null() {
         return Vec::new();
     }
     unsafe {
@@ -60,8 +60,14 @@ macro_rules! byond_fn {
             _argc: ::std::os::raw::c_int, _argv: *const *const ::std::os::raw::c_char
         ) -> *const ::std::os::raw::c_char {
             $crate::byond::set_panic_hook();
-            let closure = || ($body);
-            $crate::byond::byond_return(closure().map(From::from))
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                let closure = || ($body);
+                closure().map(From::from)
+            }));
+            match result {
+                Ok(val) => $crate::byond::byond_return(val),
+                Err(_) => $crate::byond::byond_return(None),
+            }
         }
     };
 
@@ -71,6 +77,7 @@ macro_rules! byond_fn {
         pub unsafe extern "C" fn $name(
             _argc: ::std::os::raw::c_int, _argv: *const *const ::std::os::raw::c_char
         ) -> *const ::std::os::raw::c_char {
+            $crate::byond::set_panic_hook();
             let __args = unsafe { $crate::byond::parse_args(_argc, _argv) };
 
             let mut __argn = 0;
@@ -82,8 +89,14 @@ macro_rules! byond_fn {
                 let $rest = __args.get(__argn..).unwrap_or(&[]);
             )?
 
-            let closure = || ($body);
-            $crate::byond::byond_return(closure().map(From::from))
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                let closure = || ($body);
+                closure().map(From::from)
+            }));
+            match result {
+                Ok(val) => $crate::byond::byond_return(val),
+                Err(_) => $crate::byond::byond_return(None),
+            }
         }
     };
 }

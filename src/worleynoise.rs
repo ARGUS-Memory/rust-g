@@ -1,5 +1,4 @@
-use crate::error::Result;
-use core::panic;
+use crate::error::{Error, Result};
 use rand::{
     RngExt,
     distr::{Bernoulli, Distribution},
@@ -7,7 +6,10 @@ use rand::{
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 use std::{
     collections::HashSet,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 byond_fn!(fn worley_generate(region_size, threshold, node_per_region_chance, size, node_min, node_max) {
@@ -19,7 +21,7 @@ const RANGE: usize = 4;
 // This is a quite complex algorithm basically what it does is it creates 2 maps, one filled with cells and the other with 'regions' that map onto these cells.
 // Each region can spawn 1 node, the cell then determines wether it is true or false depending on the distance from it to the nearest node in the region minus the second closest node.
 // If this distance is greater than the threshold then the cell is true, otherwise it is false.
-fn worley_noise(
+pub fn worley_noise(
     str_reg_size: &str,
     str_positive_threshold: &str,
     str_node_per_region_chance: &str,
@@ -79,21 +81,19 @@ impl NoiseCellMap {
     fn node_fill(&mut self, mut node_min: u32, mut node_max: u32, node_chance: usize) -> &mut Self {
         node_min = node_min.max(1);
         node_max = node_min.max(node_max);
-        let node_counter: Arc<RwLock<usize>> = Arc::new(RwLock::new(0));
+        let node_counter = Arc::new(AtomicUsize::new(0));
         let reg_size = self.reg_size;
         let prob = Bernoulli::new((node_chance as f64 / 100.0).clamp(0.0, 1.0)).unwrap(); // unwrap is safe bc we clamp to 0-1 anyways
         self.reg_vec.par_iter_mut().flatten().for_each(|region| {
             let mut rng = rand::rng();
-            // basically, to make sure the algorithm works optimally or rather works at all without panicing we have to ensure we spawn at least some nodes
-            // this amount of nodes scales inversely to range.
-            {
-                let mut write_guard = node_counter.write().unwrap();
-                if (*write_guard < RANGE) && !prob.sample(&mut rng) {
-                    *write_guard += 1;
-                    return;
-                }
-                *write_guard = 0;
+            // Ensure at least some nodes spawn even at low probability — count scales inversely to range.
+            // Relaxed ordering is fine: this is approximate node distribution, not a synchronisation primitive.
+            let count = node_counter.load(Ordering::Relaxed);
+            if count < RANGE && !prob.sample(&mut rng) {
+                node_counter.fetch_add(1, Ordering::Relaxed);
+                return;
             }
+            node_counter.store(0, Ordering::Relaxed);
 
             let amt = rng.random_range(node_min..node_max);
             for _ in 0..amt {
@@ -126,7 +126,7 @@ impl NoiseCellMap {
     }
 
     fn worley_fill(&mut self, threshold: f32) -> Result<Vec<Vec<bool>>> {
-        let new_data = self
+        let new_data: Option<Vec<NoiseCellRegion>> = self
             .reg_vec
             .par_iter()
             .flatten()
@@ -141,26 +141,24 @@ impl NoiseCellMap {
                         nodes_in_range =
                             self.get_nodes_in_range(region.reg_coordinates, (i + RANGE) as i32);
                         if i > 32 {
-                            panic!("Not enough nodes in range!");
+                            return None; // propagated as Err below
                         }
                     }
                 }
                 for x in 0..region.reg_size {
                     for y in 0..region.reg_size {
-                        edit_region.cell_vec[x as usize][y as usize] = (get_nth_smallest_dist(
+                        let (d0, d1) = two_closest_dists(
                             region.to_global_coordinates((x, y)),
-                            1,
                             &nodes_in_range,
-                        ) - get_nth_smallest_dist(
-                            region.to_global_coordinates((x, y)),
-                            0,
-                            &nodes_in_range,
-                        )) > threshold;
+                        );
+                        edit_region.cell_vec[x as usize][y as usize] = (d1 - d0) > threshold;
                     }
                 }
-                edit_region
+                Some(edit_region)
             })
-            .collect::<Vec<NoiseCellRegion>>();
+            .collect();
+        let new_data = new_data
+            .ok_or_else(|| Error::Panic("Not enough nodes in range".to_string()))?;
         let full_size = self.reg_amt as usize * self.reg_size as usize;
         let mut final_vec: Vec<Vec<bool>> = Vec::with_capacity(full_size);
         for _ in 0..full_size {
@@ -222,6 +220,104 @@ impl NoiseCellRegion {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sqr_distance_same_point() {
+        assert_eq!(sqr_distance((0, 0), (0, 0)), 0.0);
+    }
+
+    #[test]
+    fn test_sqr_distance_known() {
+        // 3-4-5 triangle
+        let d = sqr_distance((0, 0), (3, 4));
+        assert!((d - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_mht_distance_same_point() {
+        assert_eq!(mht_distance((0, 0), (0, 0)), 0.0);
+    }
+
+    #[test]
+    fn test_mht_distance_known() {
+        assert_eq!(mht_distance((0, 0), (3, 4)), 7.0);
+        assert_eq!(mht_distance((1, 1), (4, 5)), 7.0);
+    }
+
+    #[test]
+    fn test_mht_distance_negative() {
+        assert_eq!(mht_distance((0, 0), (-3, -4)), 7.0);
+    }
+
+    #[test]
+    fn test_noise_cell_region_new() {
+        let region = NoiseCellRegion::new((0, 0), 5);
+        assert_eq!(region.cell_vec.len(), 5);
+        assert_eq!(region.cell_vec[0].len(), 5);
+        assert!(region.node_set.is_empty());
+    }
+
+    #[test]
+    fn test_noise_cell_region_insert_node() {
+        let mut region = NoiseCellRegion::new((0, 0), 5);
+        region.insert_node((2, 3));
+        assert!(region.node_set.contains(&(2, 3)));
+        assert_eq!(region.node_set.len(), 1);
+    }
+
+    #[test]
+    fn test_noise_cell_region_to_global() {
+        let region = NoiseCellRegion::new((2, 3), 10);
+        assert_eq!(region.to_global_coordinates((1, 2)), (21, 32));
+        assert_eq!(region.to_global_coordinates((0, 0)), (20, 30));
+    }
+
+    #[test]
+    fn test_noise_cell_region_get_nodes() {
+        let mut region = NoiseCellRegion::new((1, 1), 10);
+        region.insert_node((3, 4));
+        let nodes = region.get_nodes();
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes.contains(&(13, 14))); // global coords
+    }
+
+    #[test]
+    fn test_noise_cell_map_new() {
+        let map = NoiseCellMap::new(5, 3);
+        assert_eq!(map.reg_vec.len(), 3);
+        assert_eq!(map.reg_vec[0].len(), 3);
+        assert_eq!(map.reg_size, 5);
+        assert_eq!(map.reg_amt, 3);
+    }
+
+    #[test]
+    fn test_get_smallest_dist() {
+        let mut set = HashSet::new();
+        set.insert((0, 0));
+        set.insert((10, 10));
+        set.insert((3, 4));
+        let closest = get_smallest_dist((0, 0), &set);
+        assert_eq!(closest, (0, 0));
+    }
+
+    #[test]
+    fn test_worley_noise_generates_valid_output() {
+        // Small test: 10x10 map
+        let result = worley_noise("5", "0.5", "100", "10", "1", "3").unwrap();
+        assert_eq!(result.len(), 100); // 10*10
+        assert!(result.chars().all(|c| c == '0' || c == '1'));
+    }
+
+    #[test]
+    fn test_worley_noise_invalid_params() {
+        assert!(worley_noise("abc", "0.5", "100", "10", "1", "3").is_err());
+        assert!(worley_noise("5", "abc", "100", "10", "1", "3").is_err());
+    }
+}
+
 fn sqr_distance(p1: (i32, i32), p2: (i32, i32)) -> f32 {
     (((p1.0 - p2.0).pow(2) + (p1.1 - p2.1).pow(2)) as f32).sqrt()
 }
@@ -241,11 +337,30 @@ fn get_smallest_dist(centre: (i32, i32), set: &HashSet<(i32, i32)>) -> (i32, i32
         .expect("No minimum found")
 }
 
-fn get_nth_smallest_dist(centre: (i32, i32), mut nth: u32, set: &HashSet<(i32, i32)>) -> f32 {
+pub fn get_nth_smallest_dist(centre: (i32, i32), mut nth: u32, set: &HashSet<(i32, i32)>) -> f32 {
     let mut our_set = set.clone();
-    while nth > 0 && set.len() > 1 {
+    while nth > 0 && our_set.len() > 1 {
         our_set.remove(&get_smallest_dist(centre, &our_set));
         nth -= 1;
     }
     sqr_distance(centre, get_smallest_dist(centre, &our_set))
+}
+
+// Single O(n) pass returning (closest_dist, second_closest_dist).
+// Replaces two get_nth_smallest_dist calls per pixel — eliminates 2 HashSet clones
+// and reduces 3 linear scans to 1.
+#[inline]
+fn two_closest_dists(centre: (i32, i32), set: &HashSet<(i32, i32)>) -> (f32, f32) {
+    let mut min0 = f32::MAX;
+    let mut min1 = f32::MAX;
+    for &node in set {
+        let d = sqr_distance(centre, node);
+        if d <= min0 {
+            min1 = min0;
+            min0 = d;
+        } else if d < min1 {
+            min1 = d;
+        }
+    }
+    (min0, min1)
 }

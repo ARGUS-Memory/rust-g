@@ -1,3 +1,4 @@
+use crate::argus_json::{self, JsonPart, JsonValue};
 use redis::{Client, Commands, RedisError};
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
@@ -21,87 +22,96 @@ fn disconnect() {
     });
 }
 
+fn success_response(content: JsonPart<'_>) -> String {
+    argus_json::json_obj_mixed(&[
+        ("success", JsonPart::Bool(true)),
+        ("content", content),
+    ])
+}
+
+fn error_response(msg: &str) -> String {
+    argus_json::json_obj_mixed(&[
+        ("success", JsonPart::Bool(false)),
+        ("content", JsonPart::Str(msg)),
+    ])
+}
+
 /// <https://redis.io/commands/lpush/>
-fn lpush(key: &str, data: serde_json::Value) -> serde_json::Value {
+fn lpush(key: &str, data: JsonValue) -> String {
     REDIS_CLIENT.with(|client| {
         let client_ref = client.borrow();
         if let Some(client) = client_ref.as_ref() {
             return match client.get_connection() {
                 Ok(mut conn) => {
                     // Need to handle the case of `[{}, {}]` and `{}`
-                    let result = match data {
-                        serde_json::Value::Null => return serde_json::json!(
-                            {"success": false, "content": format!("Failed to perform LPUSH operation: Data sent was null")}
+                    let result = match &data {
+                        JsonValue::Null => return error_response(
+                            "Failed to perform LPUSH operation: Data sent was null"
                         ),
-                        serde_json::Value::Bool(_) |
-                        serde_json::Value::Number(_) |
-                        serde_json::Value::String(_) |
-                        serde_json::Value::Object(_) => conn.lpush::<&str, String, isize>(key, data.to_string()),
-                        serde_json::Value::Array(arr) => conn.lpush::<&str, Vec<String>, isize>(key, map_jvalues_to_strings(&arr)),
+                        JsonValue::Array(arr) => {
+                            let strings: Vec<String> = arr.iter().map(|v| argus_json::serialize_value(v)).collect();
+                            conn.lpush::<&str, Vec<String>, isize>(key, strings)
+                        }
+                        _ => conn.lpush::<&str, String, isize>(key, argus_json::serialize_value(&data)),
                     };
                     return match result {
-                        Ok(res) => serde_json::json!(
-                            {"success": true, "content": res}
-                        ),
-                        Err(e) => serde_json::json!(
-                            {"success": false, "content": format!("Failed to perform LPUSH operation: {e}")}
+                        Ok(res) => {
+                            let res_str = res.to_string();
+                            argus_json::json_obj_mixed(&[
+                                ("success", JsonPart::Bool(true)),
+                                ("content", JsonPart::Raw(&res_str)),
+                            ])
+                        }
+                        Err(e) => error_response(
+                            &format!("Failed to perform LPUSH operation: {e}")
                         ),
                     };
                 },
                 Err(e) => {
-                    serde_json::json!(
-                        {"success": false, "content": format!("Failed to get connection: {e}")}
-                    )
+                    error_response(&format!("Failed to get connection: {e}"))
                 }
             }
         }
-        serde_json::json!({
-            "success": false, "content": "Not Connected"
-        })
+        error_response("Not Connected")
     })
 }
 
-fn map_jvalues_to_strings(values: &[serde_json::Value]) -> Vec<String> {
-    values.iter().map(|value| value.to_string()).collect()
-}
-
 /// <https://redis.io/commands/lrange/>
-fn lrange(key: &str, start: isize, stop: isize) -> serde_json::Value {
+fn lrange(key: &str, start: isize, stop: isize) -> String {
     REDIS_CLIENT.with(|client| {
         let client_ref = client.borrow();
         if let Some(client) = client_ref.as_ref() {
             return match client.get_connection() {
                 Ok(mut conn) => match conn.lrange::<&str, Vec<String>>(key, start, stop) {
-                    Ok(res) => serde_json::json!(
-                        {"success": true, "content": res}
-                    ),
-                    Err(e) => serde_json::json!(
-                        {"success": false, "content": format!("Failed to perform LRANGE operation: {e}")}
+                    Ok(res) => {
+                        let arr = argus_json::serialize_value(
+                            &JsonValue::Array(res.into_iter().map(JsonValue::Str).collect())
+                        );
+                        argus_json::json_obj_mixed(&[
+                            ("success", JsonPart::Bool(true)),
+                            ("content", JsonPart::Raw(&arr)),
+                        ])
+                    }
+                    Err(e) => error_response(
+                        &format!("Failed to perform LRANGE operation: {e}")
                     ),
                 },
-                Err(e) =>
-                    serde_json::json!(
-                        {"success": false, "content": format!("Failed to get connection: {e}")}
-                    ),
+                Err(e) => error_response(&format!("Failed to get connection: {e}")),
             }
         }
-        serde_json::json!(
-            {"success": false, "content": "Not Connected"}
-        )
+        error_response("Not Connected")
     })
 }
 
 /// <https://redis.io/commands/lpop/>
-fn lpop(key: &str, count: Option<NonZeroUsize>) -> serde_json::Value {
+fn lpop(key: &str, count: Option<NonZeroUsize>) -> String {
     REDIS_CLIENT.with(|client| {
         let client_ref = client.borrow();
         if let Some(client) = client_ref.as_ref() {
             let mut conn = match client.get_connection() {
                 Ok(conn) => conn,
                 Err(e) => {
-                    return serde_json::json!({
-                        "success": false, "content": format!("Failed to get connection: {e}")
-                    })
+                    return error_response(&format!("Failed to get connection: {e}"))
                 }
             };
             // It will return either an Array or a BulkStr per ref
@@ -110,60 +120,60 @@ fn lpop(key: &str, count: Option<NonZeroUsize>) -> serde_json::Value {
                 None => {
                     let result = conn.lpop::<&str, String>(key, count);
                     return match result {
-                        Ok(res) => serde_json::json!({
-                            "success": true, "content": res
-                        }),
-                        Err(e) => serde_json::json!({
-                            "success": false, "content": format!("Failed to perform LPOP operation: {e}")
-                        }),
+                        Ok(res) => success_response(JsonPart::Str(&res)),
+                        Err(e) => error_response(
+                            &format!("Failed to perform LPOP operation: {e}")
+                        ),
                     };
                 }
                 Some(_) => {
                     let result = conn.lpop::<&str, Vec<String>>(key, count);
                     return match result {
-                        Ok(res) => serde_json::json!({
-                            "success": true, "content": res
-                        }),
-                        Err(e) => serde_json::json!({
-                            "success": false, "content": format!("Failed to perform LPOP operation: {e}")
-                        }),
+                        Ok(res) => {
+                            let arr = argus_json::serialize_value(
+                                &JsonValue::Array(res.into_iter().map(JsonValue::Str).collect())
+                            );
+                            argus_json::json_obj_mixed(&[
+                                ("success", JsonPart::Bool(true)),
+                                ("content", JsonPart::Raw(&arr)),
+                            ])
+                        }
+                        Err(e) => error_response(
+                            &format!("Failed to perform LPOP operation: {e}")
+                        ),
                     };
                 }
             };
         }
-        serde_json::json!({
-            "success": false, "content": "Not Connected"
-        })
+        error_response("Not Connected")
     })
 }
 
 byond_fn!(fn redis_connect_rq(addr) {
     match connect(addr) {
-        Ok(_) => Some(serde_json::json!({"success": true, "content": ""}).to_string()),
-        Err(e) => Some(serde_json::json!({
-            "success": false, "content": format!("Failed to connect to {addr}: {e}")
-        }).to_string()),
+        Ok(_) => Some(success_response(JsonPart::Str(""))),
+        Err(e) => Some(error_response(
+            &format!("Failed to connect to {addr}: {e}")
+        )),
     }
 });
 
 byond_fn!(
     fn redis_disconnect_rq() {
         disconnect();
-        Some(serde_json::json!({"success": true, "content": ""}).to_string())
+        Some(success_response(JsonPart::Str("")))
     }
 );
 
 byond_fn!(fn redis_lpush(key, elements) {
-    match serde_json::from_str(elements) {
-        Ok(elem) => Some(lpush(key, elem).to_string()),
-        Err(e) => Some(serde_json::json!({
-            "success": false, "content": format!("Failed to deserialize JSON: {e}")
-        }).to_string()),
+    match argus_json::parse_value(elements.as_bytes()) {
+        Ok(elem) => Some(lpush(key, elem)),
+        Err(_) => Some(error_response("Failed to deserialize JSON")),
     }
 });
 
 byond_fn!(fn redis_lrange(key, start, stop) {
-    Some(lrange(key, start.parse().unwrap_or(0), stop.parse().unwrap_or(-1)).to_string())
+    Some(lrange(key, start.parse().unwrap_or(0), stop.parse().unwrap_or(-1)))
 });
 
 byond_fn!(fn redis_lpop(key, count) {
@@ -172,5 +182,5 @@ byond_fn!(fn redis_lpop(key, count) {
     } else {
         count.parse().unwrap_or(0)
     };
-    Some(lpop(key, std::num::NonZeroUsize::new(count_parsed)).to_string())
+    Some(lpop(key, std::num::NonZeroUsize::new(count_parsed)))
 });

@@ -5,7 +5,7 @@ use dmi::{
     icon::{Icon, IconState, dir_to_dmi_index},
 };
 use image::RgbaImage;
-use once_cell::sync::{Lazy, OnceCell};
+use std::sync::{LazyLock, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs::File, hash::BuildHasherDefault, io::BufReader, path::PathBuf, sync::Arc};
 use tracy_full::zone;
@@ -29,13 +29,13 @@ impl Drop for CacheGuard {
 }
 
 /// A cache of UniversalIcon to UniversalIconData. In order for something to exist in this cache, it must have had any transforms applied to the images.
-static ICON_STATES: Lazy<
+static ICON_STATES: LazyLock<
     DashMap<UniversalIcon, Arc<UniversalIconData>, BuildHasherDefault<XxHash64>>,
-> = Lazy::new(|| DashMap::with_hasher(BuildHasherDefault::<XxHash64>::default()));
+> = LazyLock::new(|| DashMap::with_hasher(BuildHasherDefault::<XxHash64>::default()));
 
-static ICON_STATES_FLAT: Lazy<
+static ICON_STATES_FLAT: LazyLock<
     DashMap<UniversalIcon, Arc<UniversalIconData>, BuildHasherDefault<XxHash64>>,
-> = Lazy::new(|| DashMap::with_hasher(BuildHasherDefault::<XxHash64>::default()));
+> = LazyLock::new(|| DashMap::with_hasher(BuildHasherDefault::<XxHash64>::default()));
 
 pub fn image_cache_contains(icon: &UniversalIcon, flatten: bool) -> bool {
     let _guard = CacheGuard::new();
@@ -216,18 +216,18 @@ pub fn cache_transformed_images(
 }
 
 /* ---- DMI CACHING ---- */
-type IconMap = DashMap<String, OnceCell<Arc<Icon>>, BuildHasherDefault<XxHash64>>;
+type IconMap = DashMap<String, OnceLock<Arc<Icon>>, BuildHasherDefault<XxHash64>>;
 
 /// A cache of DMI filepath -> Icon objects.
-static ICON_FILES: Lazy<IconMap> =
-    Lazy::new(|| DashMap::with_hasher(BuildHasherDefault::<XxHash64>::default()));
+static ICON_FILES: LazyLock<IconMap> =
+    LazyLock::new(|| DashMap::with_hasher(BuildHasherDefault::<XxHash64>::default()));
 
 pub fn icon_cache_clear() {
     let _guard = CacheGuard::new();
     ICON_FILES.clear();
 }
 
-pub static ICON_ROOT: Lazy<PathBuf> = Lazy::new(|| std::env::current_dir().unwrap());
+pub static ICON_ROOT: LazyLock<PathBuf> = LazyLock::new(|| std::env::current_dir().unwrap());
 
 /// Given a DMI filepath, returns a DMI Icon structure and caches it.
 pub fn filepath_to_dmi(icon_path: &str) -> Result<Arc<Icon>, String> {
@@ -237,7 +237,11 @@ pub fn filepath_to_dmi(icon_path: &str) -> Result<Arc<Icon>, String> {
 
     let cell = ICON_FILES.entry(icon_path.to_owned()).or_default();
 
-    cell.get_or_try_init(|| {
+    if let Some(cached) = cell.get() {
+        return Ok(cached.clone());
+    }
+
+    let icon = {
         zone!("open_dmi_file");
         let reader = File::open(&full_path).map(BufReader::new).map_err(|err| {
             format!(
@@ -251,7 +255,10 @@ pub fn filepath_to_dmi(icon_path: &str) -> Result<Arc<Icon>, String> {
         zone!("parse_dmi");
         Icon::load(reader)
             .map(Arc::new)
-            .map_err(|err| format!("DMI '{icon_path}' failed to parse - {err}"))
-    })
-    .cloned()
+            .map_err(|err| format!("DMI '{icon_path}' failed to parse - {err}"))?
+    };
+
+    // Another thread may have initialized it while we were loading — that's fine,
+    // get_or_init ensures only one value wins.
+    Ok(cell.get_or_init(|| icon).clone())
 }

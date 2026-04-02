@@ -1,6 +1,6 @@
 use dmi::icon::{IconState, Looping};
 use image::RgbaImage;
-use ordered_float::OrderedFloat;
+use super::ord_float::OrderedFloat;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tracy_full::zone;
@@ -80,17 +80,17 @@ pub enum Transform {
     },
     #[rustfmt::skip]
     MapColors {
-        rr: OrderedFloat<f32>, rg: OrderedFloat<f32>, rb: OrderedFloat<f32>, ra: Option<OrderedFloat<f32>>,
-        gr: OrderedFloat<f32>, gg: OrderedFloat<f32>, gb: OrderedFloat<f32>, ga: Option<OrderedFloat<f32>>,
-        br: OrderedFloat<f32>, bg: OrderedFloat<f32>, bb: OrderedFloat<f32>, ba: Option<OrderedFloat<f32>>,
-        ar: Option<OrderedFloat<f32>>, ag: Option<OrderedFloat<f32>>, ab: Option<OrderedFloat<f32>>, aa: Option<OrderedFloat<f32>>,
-        r0: Option<OrderedFloat<f32>>, g0: Option<OrderedFloat<f32>>, b0: Option<OrderedFloat<f32>>, a0: Option<OrderedFloat<f32>>,
+        rr: OrderedFloat, rg: OrderedFloat, rb: OrderedFloat, ra: Option<OrderedFloat>,
+        gr: OrderedFloat, gg: OrderedFloat, gb: OrderedFloat, ga: Option<OrderedFloat>,
+        br: OrderedFloat, bg: OrderedFloat, bb: OrderedFloat, ba: Option<OrderedFloat>,
+        ar: Option<OrderedFloat>, ag: Option<OrderedFloat>, ab: Option<OrderedFloat>, aa: Option<OrderedFloat>,
+        r0: Option<OrderedFloat>, g0: Option<OrderedFloat>, b0: Option<OrderedFloat>, a0: Option<OrderedFloat>,
     },
     Flip {
         dir: u8,
     },
     Turn {
-        angle: OrderedFloat<f32>,
+        angle: OrderedFloat,
     },
     Shift {
         dir: u8,
